@@ -68,7 +68,7 @@ Results for each experiment are saved to `HOME_FOLDER/results/` as pickle files.
 | Experiments | Content | Time |
 |-------------|---------|------|
 | 1–7 | FBCSP + supervised models (with/without S&R) | 2–3 hours total |
-| 8–9 | BYOL pretrain + fine-tune | 30–60 min each |
+| 8–9 | BYOL pretrain + fine-tune | 30–60 min per each epoch |
 | 10 | Leave-one-out ablation (32 runs) | Several hours and is checkpointed/safe to interrupt |
 
 ---
