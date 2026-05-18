@@ -1,4 +1,4 @@
-# CMSC 678 Final Project — BCI Motor Imagery Classification
+# CMSC 678 Final Project: BCI Motor Imagery Classification
 
 4-class EEG motor imagery classification on [BCI Competition IV Dataset 2a](https://www.bbci.de/competition/iv/). We benchmark FBCSP, EEGNet, ATCNet, MI-Mamba, and BYOL-pretrained EEGNet with and without Segmentation and Recombination (S&R) augmentation, with a focus on whether these approaches help BCI-inefficient users (low performers).
 
