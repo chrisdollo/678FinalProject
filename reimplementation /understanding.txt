@@ -1,0 +1,309 @@
+================================================================================
+UNDERSTANDING THE DATA
+================================================================================
+
+--------------------------------------------------------------------------------
+1. SHAPE
+--------------------------------------------------------------------------------
+   X_train.shape == (288, 22, 512)
+                     │    │    │
+                     │    │    └─ time samples: 4 s × 128 Hz
+                     │    │       (raw is 250 Hz; subject_to_arrays resamples)
+                     │    │
+                     │    └─ EEG channels (the 22 kept after dropping 3 EOG)
+                     │
+                     └─ trials per session
+                        288 = 72 left + 72 right + 72 feet + 72 tongue
+
+   X_eval.shape  == (288, 22, 512)   same structure, second session
+   y_train, y_eval ∈ {0, 1, 2, 3}    one label per trial
+
+--------------------------------------------------------------------------------
+2. WHY THESE NUMBERS
+--------------------------------------------------------------------------------
+   9 subjects
+    └── 2 sessions per subject (recorded different days)
+         └── 6 runs per session
+              └── 48 trials per run (12 per class × 4 classes)
+                   = 288 trials per session = 72 per class
+
+   The project uses session 1 (T) for training, session 2 (E) for evaluation —
+   never combines them. So per-session is 72/class, not 144.
+
+   Classes (label → imagery → cue arrow):
+      0 → left hand    (←)        2 → both feet    (↓)
+      1 → right hand   (→)        3 → tongue       (↑)
+
+--------------------------------------------------------------------------------
+3. FILES (per subject x ∈ {1..9})
+--------------------------------------------------------------------------------
+   A0xT.npz   training session signal — keys: s, epos, etyp, edur, artifacts
+              `etyp` contains class codes 769/770/771/772 directly (labels visible).
+
+   A0xE.npz   evaluation session signal — same keys
+              `etyp` is 783 (unknown) at every cue — labels withheld.
+
+   A0xE.mat   evaluation labels (released after competition closed)
+              key: classlabel — 1-D array of 1–4, in cue order.
+              The project subtracts 1 to get 0-indexed labels.
+
+   `.npz` keys recap:
+      s         (n_samples, 25) raw signal at 250 Hz; only first 22 are EEG
+      epos      sample indices of every event (cue position for trial events)
+      etyp      event-type codes — only 769–772 (class cues, training) and
+                 783 (unknown cue, eval) matter for trial extraction
+      edur      event durations (unused by project)
+      artifacts per-trial artifact mask (unused by project)
+
+--------------------------------------------------------------------------------
+4. THE 22 EEG CHANNELS (column index in `s[:, :22]`)
+--------------------------------------------------------------------------------
+   Standard 10-20 montage centred on the sensorimotor cortex:
+      0:Fz  1:FC3 2:FC1 3:FCz 4:FC2 5:FC4
+      6:C5  7:C3  8:C1  9:Cz  10:C2 11:C4 12:C6
+      13:CP3 14:CP1 15:CPz 16:CP2 17:CP4
+      18:P1 19:Pz 20:P2 21:POz
+
+   ★ C3 (idx 7) and C4 (idx 11) sit over the hand-motor cortex — they carry
+     most of the mu/beta event-related desynchronization (ERD) signal that
+     every classifier in this project ultimately relies on.
+
+--------------------------------------------------------------------------------
+5. TRIAL TIMING
+--------------------------------------------------------------------------------
+   t = 0 s   trial start, fixation cross + beep
+   t = 2 s   cue arrow appears  ← `epos` points HERE (not t = 0)
+   t = 6 s   end of motor imagery period
+
+   Analysis window = t = 2 to 6 s = 4 seconds × 128 Hz = 512 samples.
+
+================================================================================
+6. EXPERIMENT PLAN — WHY THESE MODELS, IN THIS ORDER
+================================================================================
+The paper asks one central question: do modern deep-learning architectures help
+LOW performers more than HIGH performers (the BCI-inefficiency hypothesis)?
+Answering that needs a chain of experiments, each adding one capability so we
+can attribute any gain to a specific cause:
+
+   1. FBCSP   — classical baseline. No deep learning. Defines the ceiling
+                of "engineering features by hand" and the high/low split.
+   2. EEGNet  — smallest deep CNN built for EEG. Asks "does deep learning
+                help at all over a tuned classical pipeline?" Cheap, so
+                run before the bigger nets.
+   3. ATCNet  — adds attention + temporal convolution. Asks "does modeling
+                long-range temporal context on top of EEGNet help?"
+   4. Mamba   — selective state-space sequence model. Asks "does a modern
+                sequence model trained from scratch beat attention?"
+
+Those four are the SUPERVISED axis (model complexity going up). Then we add
+two ORTHOGONAL interventions:
+
+   5. S&R augmentation     — synthetic trials made by recombining segments
+                             across same-class trials. Asks "does more data
+                             (synthetically) close the low-performer gap?"
+   6. BYOL self-supervised — pretrain on the OTHER 8 subjects' unlabeled
+                             signal (LOSO), then finetune on the target.
+                             Asks "does cross-subject unlabeled data
+                             transfer to low performers?"
+
+Finally a leave-one-source-out ablation isolates which donor subjects matter
+most for low-performer transfer.
+
+Throughout, the FBCSP-defined high/low split is reused (never recomputed). Every
+table in the report is read as a delta vs. the row above.
+
+================================================================================
+7. WHY FBCSP IS EXPERIMENT #1
+================================================================================
+**FBCSP = Filter Bank Common Spatial Pattern** (Ang et al. 2008): 9 Butterworth
+bands (4–40 Hz) → per-band CSP spatial filters → MIBIF feature selection → LDA.
+Classical, deterministic, CPU-only — pre-deep-learning gold standard.
+
+It has three jobs:
+  (a) **Baseline.** Every later model is reported as ΔAcc vs. FBCSP.
+  (b) **Defines the high/low split.** Median of per-subject FBCSP acc →
+      high = {1,3,7,8,9}, low = {2,4,5,6}. Used for RQ1–RQ4.
+  (c) **Sanity check.** No GPU, no randomness — if mean ≠ ~0.634 and S03/S06
+      ≠ best/worst, the bug is in the data pipeline, not the model.
+
+Expected: 9 per-subject accuracies (mean ≈ 0.634) + 4×4 confusion matrix.
+
+================================================================================
+8. WHY EEGNET IS EXPERIMENT #2
+================================================================================
+**EEGNet** (Lawhern et al. 2018) is the smallest, most established CNN built
+specifically for EEG. ~2k parameters; trains in a few minutes per subject on
+GPU. Two stages:
+   - Temporal conv across time (kernel 64) per channel
+   - Depthwise + separable conv across the 22 channels
+
+It earns experiment #2 for three reasons:
+  (a) **Cheapest test of "does deep learning help at all?"** If EEGNet doesn't
+      beat FBCSP, no point training the bigger nets.
+  (b) **Anchor for the deep-learning baseline.** ATCNet and Mamba are reported
+      as Δacc vs. EEGNet (and vs. FBCSP), not in absolute terms.
+  (c) **First test of the BCI-inefficiency hypothesis.** We compare the gain
+      over FBCSP for high {1,3,7,8,9} vs. low {2,4,5,6} performers. If the
+      low group gains more, the hypothesis survives the first round.
+
+Expected: per-subject accuracies, mean ≈ 0.71–0.74 (typical range for EEGNet
+on BCI IV-2a), confusion matrix more diagonal than FBCSP — especially the
+tongue/feet pair should improve.
+
+================================================================================
+9. WHY ATCNET IS EXPERIMENT #3
+================================================================================
+**ATCNet** (Altaheri et al. 2022) keeps EEGNet's front-end (temporal +
+depthwise/separable convs across the 22 channels) and adds an "ATC" block:
+   - Sliding window over the time axis -> several short windows per trial
+   - Multi-head self-attention inside each window
+   - Temporal convolution after attention
+   - Window predictions averaged into the final logit
+
+About 150k params — ~75x EEGNet but still small compared to a vision
+transformer. Trains in roughly the same wall-clock per subject.
+
+It earns experiment #3 for two reasons:
+  (a) **Tests the attention hypothesis directly.** ATCNet ≈ EEGNet + attention,
+      so any gain over EEGNet is attributable to the ATC block — not to a
+      different front-end or different preprocessing.
+  (b) **Strongest published supervised result on BCI IV-2a** (~0.81 mean in
+      the original paper). If our reimplementation is in that ballpark, the
+      pipeline is faithful and we can trust the deltas downstream.
+
+Expected: mean accuracy ≈ 0.78–0.82, larger gain over FBCSP than EEGNet,
+confusion matrix tighter still on tongue/feet.
+
+================================================================================
+10. WHY MAMBA IS EXPERIMENT #4
+================================================================================
+**MI-Mamba** wraps the Mamba selective state-space backbone (Gu & Dao 2023)
+for motor-imagery EEG. State-space models replace attention's O(N²) global
+mixing with an O(N) recurrence whose dynamics depend on the input — they keep
+long-range context without paying the attention price.
+
+Why it lands at experiment #4 (after ATCNet, not before):
+  (a) **Tests "does a modern non-attention sequence model help?"** ATCNet is
+      our attention reference; Mamba is the head-to-head modern alternative.
+  (b) **Slowest of the supervised four** (uses 500 epochs by default vs. 300
+      for EEGNet/ATCNet — see `normal_results.py`). Cheaper models go first
+      so we don't wait on Mamba to discover an upstream bug.
+  (c) **Sets the supervised ceiling.** After Mamba we move off the supervised
+      axis entirely — onto S&R augmentation (exp 5) and BYOL self-supervised
+      pretraining (exp 6).
+
+Expected: mean accuracy in roughly the same range as ATCNet (≈0.78–0.82) but
+with a different per-subject pattern — Mamba may help a different subset of
+subjects than attention does. The interesting comparison is Δ-by-group, not
+absolute mean.
+
+================================================================================
+11. WHY S&R AUGMENTATION (EXPERIMENTS 5, 6, 7)
+================================================================================
+**S&R = Segmentation & Recombination** (Lotte 2015; the variant in
+`sr_augmentation.py:augment_trials_SR`):
+
+   For each real trial of class c:
+     1. Cut it into n_segments halves along the time axis (default 2).
+     2. For each half, pick a RANDOM donor trial of the same class c
+        and copy that donor's corresponding half into the synthetic trial.
+   Repeat n_augmented=2 times per real trial.
+   -> output size: 288 + 288 + 288 = 864 trials per subject.
+
+So the synthetic trials preserve the class label, the channel layout, and the
+broad temporal structure of a class-c trial, but the first half comes from a
+different recording session moment than the second half. The model sees more
+diverse (channel × time) combinations without inventing artificial signals
+from noise.
+
+**Why we use it (and why it's the augmentation to test for BCI inefficiency):**
+
+  (a) **Cheapest augmentation that respects EEG physics.** Generic
+      augmentations (Gaussian noise, time-warping, channel dropout) can
+      damage the mu/beta ERD that motor-imagery classifiers depend on. S&R
+      shuffles ONLY across same-class trials, so the spectral content per
+      class is preserved.
+
+  (b) **Tests the "data-starved" half of the BCI-inefficiency hypothesis.**
+      One theory of why some users are "BCI-illiterate" is that their signal
+      is just noisier, so 288 trials isn't enough to fit a deep model
+      cleanly. S&R triples the training set without collecting new sessions.
+      If low performers gain MORE from S&R than high performers, the
+      bottleneck for low subjects is data, not signal.
+
+  (c) **Same hypothesis test, second axis.** Experiments 2-4 vary model
+      capacity at fixed data. Experiments 5-7 vary data at fixed model.
+      Together they tell us whether the inefficiency advantage comes from
+      bigger models, more data, or both.
+
+We DO NOT augment the eval set — that would inflate accuracy without
+matching paper protocol. Only X_train is replaced by augment_trials_SR(...).
+
+Expected: per-model gain over the no-aug version, larger for low than high
+performers. The paper's RQ2 is roughly "does S&R help low > high?".
+
+================================================================================
+12. WHY BYOL SELF-SUPERVISED PRETRAIN (EXPERIMENTS 8, 9, 10)
+================================================================================
+**BYOL = Bootstrap Your Own Latent** (Grill et al. 2020): a self-supervised
+method that learns useful representations WITHOUT negative pairs (no
+contrastive loss, no class labels needed). Two networks:
+
+   - **Online network**: backbone (EEGNet) + projector + predictor.
+     Updated by gradient descent.
+   - **Target network**: a momentum-averaged copy of the online network's
+     backbone + projector. No predictor, no gradients.
+
+For each unlabeled trial x, two augmented views v1 and v2 are made (Gaussian
+noise + temporal masking + amplitude scaling — see `EEGNetBYOL.py:eeg_augment`).
+The online network must PREDICT the target network's projection of the OTHER
+view: minimize 1 - cos_sim(online_predict(v1), target_project(v2)) (and
+symmetric). Target params are then updated via EMA: θ_target ← 0.996 θ_target
++ 0.004 θ_online.
+
+The result: a backbone that produces representations stable under EEG
+augmentations, learned with NO labels.
+
+**Why this is the third axis (after model capacity and S&R augmentation):**
+
+  (a) **Tests the "transfer learning" half of the inefficiency hypothesis.**
+      Maybe low performers don't lack data per se — maybe they lack a good
+      INITIALIZATION. BYOL gives every subject a backbone that already
+      knows what EEG looks like before seeing any labels.
+
+  (b) **Cross-subject signal without label leakage.** The 8 OTHER subjects'
+      eval session contains NO labels (in our reimplementation we pretrain
+      on training-session signal anyway, but the principle stands).
+      BYOL extracts what's invariant across subjects without needing
+      class labels — the kind of "what is brain activity" prior that
+      labelled training can't easily provide.
+
+LOSO = Leave-One-Subject-Out. For each target subject, BYOL pretrains on
+the OTHER 8 subjects' training-session signal (~2304 unlabeled trials)
+for 300 epochs, then a linear classifier is added and the whole online
+backbone is finetuned on the target's 288 labelled training trials.
+
+Three experiments:
+   8.  EEGNet+BYOL, no aug   — does cross-subject pretraining help at all?
+   9.  EEGNet+BYOL+S&R       — do pretraining and S&R add up, or overlap?
+  10.  Leave-one-source-out  — when finetuning the target on its 288 trials,
+                                which OTHER subjects in the BYOL pretraining
+                                pool actually contributed? Run only on the
+                                4 LOW performers; for each target × each
+                                non-target, retrain BYOL with that subject
+                                EXCLUDED and report the accuracy drop.
+                                Big drops -> donor was helpful.
+
+The exp 10 ablation directly answers RQ4: "Are HIGH donors more helpful
+than LOW donors when transferring to a struggling target?" Compare the
+mean drop when excluding {1, 3, 7, 8, 9} vs the mean drop when excluding
+{the other low subjects}.
+
+Cost notes:
+  - Exp 8 + 9: each runs 9 BYOL pretrains × 300 epochs + 9 finetunes × 300 epochs.
+    Expect ~30-90 min per experiment on A100.
+  - Exp 10 is brutal: 4 targets × 8 ablations × (150 pretrain + 300 finetune
+    epochs) = 32 BYOL runs. Multiple hours. The original `run_ablation`
+    function checkpoints after each (target, exclude) pair so you can
+    safely stop and resume.
+================================================================================
